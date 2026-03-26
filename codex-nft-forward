@@ -1,0 +1,577 @@
+#!/usr/bin/env python3
+"""Docker-safe nft forward manager with declarative state and DoH domain sync.
+
+This tool is meant to run on the remote host.
+It manages only its own nft tables and never overwrites /etc/nftables.conf.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ipaddress
+import json
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterable
+
+
+DEFAULT_CONFIG = Path("/etc/codex-nft-forward/mappings.json")
+STATE_DIR = Path("/etc/codex-nft-forward")
+REMOTE_BIN = Path("/usr/local/bin/codex-nft-forward")
+SERVICE_PATH = Path("/etc/systemd/system/codex-nft-forward.service")
+TIMER_PATH = Path("/etc/systemd/system/codex-nft-forward.timer")
+TABLE_NAME = "codex_forward"
+PREROUTING_CHAIN = "codex_prerouting"
+POSTROUTING_CHAIN = "codex_postrouting"
+PREROUTING_PRIORITY = "-101"
+POSTROUTING_PRIORITY = "99"
+COMMENT_PREFIX = "codex-forward"
+NAME_RE = re.compile(r"^[A-Za-z0-9_.:-]+$")
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def die(message: str, code: int = 1) -> int:
+    print(message, file=sys.stderr)
+    return code
+
+
+def run(
+    argv: list[str],
+    *,
+    check: bool = True,
+    input_text: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    proc = subprocess.run(
+        argv,
+        input=input_text,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if check and proc.returncode != 0:
+        cmd = " ".join(argv)
+        raise RuntimeError(f"command failed ({proc.returncode}): {cmd}\n{proc.stderr.strip()}")
+    return proc
+
+
+def nft(argv: list[str], *, check: bool = True, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
+    return run(["nft", *argv], check=check, input_text=input_text)
+
+
+def nft_available() -> bool:
+    return shutil.which("nft") is not None
+
+
+def protocol_list(value: str) -> list[str]:
+    if value == "all":
+        return ["tcp", "udp"]
+    if value in {"tcp", "udp"}:
+        return [value]
+    raise ValueError(f"unsupported protocol: {value}")
+
+
+def family_token(version: int) -> str:
+    return "ip6" if version == 6 else "ip"
+
+
+def comment_for(name: str, proto: str, port: int, target: str) -> str:
+    return f'{COMMENT_PREFIX}:{name}:{proto}:{port}:{target}'
+
+
+def load_config(path: Path) -> dict:
+    if not path.exists():
+        return {"mappings": []}
+    raw_text = path.read_text()
+    if not raw_text.strip():
+        return {"mappings": []}
+    try:
+        data = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"invalid config {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(f"invalid config root in {path}")
+    mappings = data.get("mappings")
+    if not isinstance(mappings, list):
+        raise RuntimeError(f"invalid mappings list in {path}")
+    return data
+
+
+def save_config(path: Path, config: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(config, indent=2, sort_keys=False) + "\n")
+
+
+def validate_name(name: str) -> str:
+    if not NAME_RE.fullmatch(name):
+        raise ValueError("name must match [A-Za-z0-9_.:-]+")
+    return name
+
+
+def validate_port(value: str | int) -> int:
+    port = int(value)
+    if port < 1 or port > 65535:
+        raise ValueError("port must be between 1 and 65535")
+    return port
+
+
+def validate_family_preference(value: str) -> str:
+    if value not in {"auto", "4", "6"}:
+        raise ValueError("family must be auto, 4, or 6")
+    return value
+
+
+def literal_ip(host: str) -> tuple[str, int] | None:
+    try:
+        parsed = ipaddress.ip_address(host)
+    except ValueError:
+        return None
+    return str(parsed), parsed.version
+
+
+def doh_lookup(domain: str, qtype: str) -> str | None:
+    params = urllib.parse.urlencode({"name": domain, "type": qtype})
+    req = urllib.request.Request(
+        f"https://1.1.1.1/dns-query?{params}",
+        headers={"accept": "application/dns-json", "user-agent": "codex-nft-forward/1"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            payload = json.loads(resp.read().decode())
+    except Exception:
+        return None
+    answers = payload.get("Answer") or []
+    for answer in answers:
+        data = answer.get("data")
+        if not isinstance(data, str):
+            continue
+        try:
+            parsed = ipaddress.ip_address(data)
+        except ValueError:
+            continue
+        if qtype == "A" and parsed.version == 4:
+            return str(parsed)
+        if qtype == "AAAA" and parsed.version == 6:
+            return str(parsed)
+    return None
+
+
+def socket_lookup(domain: str, family: int) -> str | None:
+    families = {4: socket.AF_INET, 6: socket.AF_INET6}
+    try:
+        records = socket.getaddrinfo(domain, None, families[family], socket.SOCK_STREAM)
+    except OSError:
+        return None
+    for record in records:
+        addr = record[4][0]
+        try:
+            parsed = ipaddress.ip_address(addr)
+        except ValueError:
+            continue
+        if parsed.version == family:
+            return str(parsed)
+    return None
+
+
+def resolve_target(target_host: str, family_pref: str) -> tuple[str, int]:
+    literal = literal_ip(target_host)
+    if literal:
+        return literal
+
+    requested = [4, 6] if family_pref == "auto" else [int(family_pref)]
+    for family in requested:
+        qtype = "A" if family == 4 else "AAAA"
+        result = doh_lookup(target_host, qtype) or socket_lookup(target_host, family)
+        if result:
+            return result, family
+    raise RuntimeError(f"failed to resolve target host: {target_host}")
+
+
+@dataclass
+class Mapping:
+    name: str
+    local_port: int
+    target_host: str
+    target_port: int
+    protocols: list[str]
+    family_preference: str
+    resolved_ip: str | None = None
+    resolved_family: int | None = None
+    updated_at: str | None = None
+
+    @classmethod
+    def from_dict(cls, raw: dict) -> "Mapping":
+        if "protocol" in raw:
+            protocols = protocol_list(str(raw.get("protocol", "all")))
+        else:
+            protocols = [str(p) for p in raw.get("protocols", ["tcp", "udp"])]
+            for proto in protocols:
+                if proto not in {"tcp", "udp"}:
+                    raise ValueError(f"unsupported protocol in config: {proto}")
+        return cls(
+            name=validate_name(str(raw["name"])),
+            local_port=validate_port(raw["local_port"]),
+            target_host=str(raw["target_host"]),
+            target_port=validate_port(raw["target_port"]),
+            protocols=protocols,
+            family_preference=validate_family_preference(str(raw.get("family_preference", "auto"))),
+            resolved_ip=raw.get("resolved_ip"),
+            resolved_family=raw.get("resolved_family"),
+            updated_at=raw.get("updated_at"),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "local_port": self.local_port,
+            "target_host": self.target_host,
+            "target_port": self.target_port,
+            "protocols": self.protocols,
+            "family_preference": self.family_preference,
+            "resolved_ip": self.resolved_ip,
+            "resolved_family": self.resolved_family,
+            "updated_at": self.updated_at,
+        }
+
+
+def mappings_from_config(config: dict) -> list[Mapping]:
+    mappings = [Mapping.from_dict(entry) for entry in config.get("mappings", [])]
+    validate_unique_bindings(mappings)
+    return mappings
+
+
+def validate_unique_bindings(mappings: Iterable[Mapping]) -> None:
+    seen: dict[tuple[int | str, str, int], str] = {}
+    for mapping in mappings:
+        family_hint: int | str = mapping.family_preference if mapping.family_preference != "auto" else "auto"
+        for proto in mapping.protocols:
+            key = (family_hint, proto, mapping.local_port)
+            other = seen.get(key)
+            if other and other != mapping.name:
+                raise RuntimeError(
+                    f"duplicate binding for {proto}/{mapping.local_port} under family {family_hint}: "
+                    f"{other} vs {mapping.name}"
+                )
+            seen[key] = mapping.name
+
+
+def reconcile_resolved_fields(mappings: list[Mapping]) -> list[str]:
+    changes: list[str] = []
+    for mapping in mappings:
+        resolved_ip, resolved_family = resolve_target(mapping.target_host, mapping.family_preference)
+        if mapping.resolved_ip != resolved_ip or mapping.resolved_family != resolved_family:
+            before = mapping.resolved_ip or "unset"
+            changes.append(f"{mapping.name}: {before} -> {resolved_ip}")
+        mapping.resolved_ip = resolved_ip
+        mapping.resolved_family = resolved_family
+        mapping.updated_at = now_iso()
+    return changes
+
+
+def desired_rule_lines(mappings: list[Mapping]) -> dict[int, list[str]]:
+    family_rules: dict[int, list[str]] = {4: [], 6: []}
+    for mapping in mappings:
+        if mapping.resolved_ip is None or mapping.resolved_family is None:
+            raise RuntimeError(f"mapping {mapping.name} has no resolved target")
+        fam = family_token(mapping.resolved_family)
+        target = mapping.resolved_ip
+        dnat_target = f"[{target}]:{mapping.target_port}" if mapping.resolved_family == 6 else f"{target}:{mapping.target_port}"
+        for proto in mapping.protocols:
+            comment = comment_for(mapping.name, proto, mapping.local_port, mapping.target_host)
+            family_rules[mapping.resolved_family].append(
+                f'add rule {fam} {TABLE_NAME} {PREROUTING_CHAIN} {proto} dport {mapping.local_port} counter '
+                f'dnat to {dnat_target} comment "{comment}"'
+            )
+            addr_kw = "ip6" if mapping.resolved_family == 6 else "ip"
+            family_rules[mapping.resolved_family].append(
+                f'add rule {fam} {TABLE_NAME} {POSTROUTING_CHAIN} {addr_kw} daddr {target} '
+                f'{proto} dport {mapping.target_port} counter masquerade comment "{comment}"'
+            )
+    return family_rules
+
+
+def apply_rules(mappings: list[Mapping], *, dry_run: bool, quiet: bool) -> list[str]:
+    resolved_changes = reconcile_resolved_fields(mappings)
+    rules_by_family = desired_rule_lines(mappings)
+
+    if not dry_run:
+        for family in (4, 6):
+            nft(["delete", "table", family_token(family), TABLE_NAME], check=False)
+
+    applied: list[str] = []
+    for family in (4, 6):
+        lines = rules_by_family[family]
+        fam = family_token(family)
+        if not lines:
+            applied.append(f"{fam}: cleared")
+            continue
+        script_lines = [
+            f"add table {fam} {TABLE_NAME}",
+            (
+                f"add chain {fam} {TABLE_NAME} {PREROUTING_CHAIN} "
+                f"{{ type nat hook prerouting priority {PREROUTING_PRIORITY}; policy accept; }}"
+            ),
+            (
+                f"add chain {fam} {TABLE_NAME} {POSTROUTING_CHAIN} "
+                f"{{ type nat hook postrouting priority {POSTROUTING_PRIORITY}; policy accept; }}"
+            ),
+            *lines,
+        ]
+        if dry_run:
+            print(f"# --- {fam} plan ---")
+            print("\n".join(script_lines))
+        else:
+            nft(["-f", "-"], input_text="\n".join(script_lines) + "\n")
+        applied.append(f"{fam}: {len(lines) // 2} mapping(s)")
+
+    if not quiet:
+        for item in resolved_changes:
+            print(f"RESOLVED: {item}")
+        for item in applied:
+            print(f"APPLY: {item}")
+    return resolved_changes
+
+
+def collect_conflicts(mappings: list[Mapping]) -> list[str]:
+    if not nft_available():
+        return []
+    desired = set()
+    for mapping in mappings:
+        family = family_token(mapping.resolved_family or 4)
+        for proto in mapping.protocols:
+            desired.add((family, proto, str(mapping.local_port)))
+
+    proc = nft(["-a", "list", "ruleset"], check=False)
+    if proc.returncode != 0:
+        return []
+
+    current_family = ""
+    current_table = ""
+    warnings: list[str] = []
+    seen = set()
+    for raw_line in proc.stdout.splitlines():
+        line = raw_line.strip()
+        table_match = re.match(r"table\s+(\S+)\s+(\S+)\s*\{", line)
+        if table_match:
+            current_family, current_table = table_match.groups()
+            continue
+        if "dnat to" not in line or current_table == TABLE_NAME:
+            continue
+        port_match = re.search(r"\b(tcp|udp)\b.*\bdport\s+(\d+)", line)
+        if not port_match:
+            continue
+        proto, port = port_match.groups()
+        key = (current_family, proto, port)
+        if key in desired and key not in seen:
+            warnings.append(f"legacy DNAT still exists for {current_family} {proto}/{port} outside {TABLE_NAME}")
+            seen.add(key)
+    return warnings
+
+
+def print_list(mappings: list[Mapping], *, json_output: bool) -> None:
+    if json_output:
+        print(json.dumps([mapping.to_dict() for mapping in mappings], indent=2))
+        return
+    if not mappings:
+        print("no mappings")
+        return
+    print("name\tlocal_port\tprotocols\ttarget_host\ttarget_port\tfamily\tresolved_ip")
+    for mapping in mappings:
+        print(
+            f"{mapping.name}\t{mapping.local_port}\t{','.join(mapping.protocols)}\t"
+            f"{mapping.target_host}\t{mapping.target_port}\t{mapping.family_preference}\t"
+            f"{mapping.resolved_ip or '-'}"
+        )
+
+
+def install_systemd(interval_seconds: int) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    service = f"""[Unit]
+Description=Codex nft forward reconcile
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart={REMOTE_BIN} apply --quiet
+"""
+    timer = f"""[Unit]
+Description=Periodic Codex nft forward reconcile
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec={interval_seconds}s
+Unit=codex-nft-forward.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+"""
+    SERVICE_PATH.write_text(service)
+    TIMER_PATH.write_text(timer)
+    run(["systemctl", "daemon-reload"])
+    run(["systemctl", "enable", "--now", "codex-nft-forward.timer"])
+    run(["systemctl", "start", "codex-nft-forward.service"])
+    print(f"installed systemd service and timer (interval={interval_seconds}s)")
+
+
+def upsert_mapping(config_path: Path, args: argparse.Namespace) -> int:
+    config = load_config(config_path)
+    mappings = config.get("mappings", [])
+    replacement = {
+        "name": validate_name(args.name),
+        "local_port": validate_port(args.local_port),
+        "target_host": args.target_host,
+        "target_port": validate_port(args.target_port),
+        "protocols": protocol_list(args.protocol),
+        "family_preference": validate_family_preference(args.family),
+        "updated_at": now_iso(),
+    }
+    updated = False
+    next_mappings = []
+    for entry in mappings:
+        if str(entry.get("name")) == args.name:
+            next_mappings.append(replacement)
+            updated = True
+        else:
+            next_mappings.append(entry)
+    if not updated:
+        next_mappings.append(replacement)
+    config["mappings"] = next_mappings
+    checked = mappings_from_config(config)
+    if args.dry_run:
+        print(json.dumps([mapping.to_dict() for mapping in checked], indent=2))
+        return 0
+    save_config(config_path, {"mappings": [mapping.to_dict() for mapping in checked]})
+    print(f"{'updated' if updated else 'added'} mapping: {args.name}")
+    return 0
+
+
+def remove_mapping(config_path: Path, args: argparse.Namespace) -> int:
+    config = load_config(config_path)
+    mappings = config.get("mappings", [])
+    next_mappings = [entry for entry in mappings if str(entry.get("name")) != args.name]
+    if len(next_mappings) == len(mappings):
+        return die(f"mapping not found: {args.name}")
+    if args.dry_run:
+        print(json.dumps(next_mappings, indent=2))
+        return 0
+    save_config(config_path, {"mappings": next_mappings})
+    print(f"removed mapping: {args.name}")
+    return 0
+
+
+def list_mappings(config_path: Path, args: argparse.Namespace) -> int:
+    mappings = mappings_from_config(load_config(config_path))
+    print_list(mappings, json_output=args.json)
+    return 0
+
+
+def apply_mappings(config_path: Path, args: argparse.Namespace) -> int:
+    config = load_config(config_path)
+    mappings = mappings_from_config(config)
+    resolved_changes = apply_rules(mappings, dry_run=args.dry_run, quiet=args.quiet)
+    warnings = collect_conflicts(mappings)
+    if not args.dry_run:
+        save_config(config_path, {"mappings": [mapping.to_dict() for mapping in mappings]})
+    if not args.quiet:
+        for warning in warnings:
+            print(f"WARNING: {warning}", file=sys.stderr)
+        if not warnings and not resolved_changes and not mappings:
+            print("APPLY: no mappings configured")
+    return 0
+
+
+def status(config_path: Path, args: argparse.Namespace) -> int:
+    mappings = mappings_from_config(load_config(config_path))
+    if not args.json:
+        print_list(mappings, json_output=False)
+        print()
+    nft_ok = nft_available()
+    info = {
+        "config_path": str(config_path),
+        "table": TABLE_NAME,
+        "timer_exists": TIMER_PATH.exists(),
+        "service_exists": SERVICE_PATH.exists(),
+        "managed_rules_v4": nft_ok and nft(["list", "table", "ip", TABLE_NAME], check=False).returncode == 0,
+        "managed_rules_v6": nft_ok and nft(["list", "table", "ip6", TABLE_NAME], check=False).returncode == 0,
+        "warnings": collect_conflicts(mappings),
+    }
+    if args.json:
+        print(json.dumps(info, indent=2))
+    else:
+        for key, value in info.items():
+            print(f"{key}={value}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Docker-safe nft forward manager")
+    parser.add_argument("--config", default=str(DEFAULT_CONFIG))
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_upsert = sub.add_parser("upsert", help="add or update a mapping")
+    p_upsert.add_argument("name")
+    p_upsert.add_argument("local_port")
+    p_upsert.add_argument("target_host")
+    p_upsert.add_argument("target_port")
+    p_upsert.add_argument("protocol", nargs="?", default="all")
+    p_upsert.add_argument("--family", default="auto")
+    p_upsert.add_argument("--dry-run", action="store_true")
+
+    p_remove = sub.add_parser("remove", help="remove a mapping")
+    p_remove.add_argument("name")
+    p_remove.add_argument("--dry-run", action="store_true")
+
+    p_list = sub.add_parser("list", help="list mappings")
+    p_list.add_argument("--json", action="store_true")
+
+    p_apply = sub.add_parser("apply", help="resolve targets and re-apply managed rules")
+    p_apply.add_argument("--dry-run", action="store_true")
+    p_apply.add_argument("--quiet", action="store_true")
+
+    p_status = sub.add_parser("status", help="show config and live-rule status")
+    p_status.add_argument("--json", action="store_true")
+
+    p_install = sub.add_parser("install-systemd", help="install and enable the reconcile timer")
+    p_install.add_argument("--interval", type=int, default=300)
+
+    return parser
+
+
+def main(argv: list[str]) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    config_path = Path(args.config)
+
+    try:
+        if args.cmd == "upsert":
+            return upsert_mapping(config_path, args)
+        if args.cmd == "remove":
+            return remove_mapping(config_path, args)
+        if args.cmd == "list":
+            return list_mappings(config_path, args)
+        if args.cmd == "apply":
+            return apply_mappings(config_path, args)
+        if args.cmd == "status":
+            return status(config_path, args)
+        if args.cmd == "install-systemd":
+            install_systemd(args.interval)
+            return 0
+    except (RuntimeError, ValueError, OSError) as exc:
+        return die(str(exc))
+    return die("unknown command")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
