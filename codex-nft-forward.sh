@@ -2,10 +2,15 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-HELPER="$SCRIPT_DIR/codex-nft-forward"
+LOCAL_HELPER="$SCRIPT_DIR/codex-nft-forward"
+HELPER=""
 REMOTE_BIN="/usr/local/bin/codex-nft-forward"
 SSH_BIN="${SSH_BIN:-ssh}"
 SSH_CONFIG_FILE="${SSH_CONFIG_FILE:-$HOME/.ssh/config}"
+REPO_SLUG="${CODEX_NFT_FORWARD_REPO:-reallinzc/codex-nft-forward}"
+REPO_REF="${CODEX_NFT_FORWARD_REF:-main}"
+RAW_BASE_URL="${CODEX_NFT_FORWARD_RAW_BASE_URL:-https://raw.githubusercontent.com/${REPO_SLUG}/${REPO_REF}}"
+TMP_HELPER=""
 
 usage() {
   cat <<EOF
@@ -22,14 +27,30 @@ Notes:
   - Managed rules live in dedicated nft tables named codex_forward.
   - This tool never saves the full ruleset to /etc/nftables.conf.
   - The wrapper uses standard ssh and respects \$SSH_CONFIG_FILE.
+  - If the helper binary is not present locally, the wrapper will fetch it from:
+    ${RAW_BASE_URL}/codex-nft-forward
 EOF
 }
 
 need_helper() {
-  [[ -f "$HELPER" ]] || {
-    echo "helper not found: $HELPER" >&2
+  if [[ -f "$LOCAL_HELPER" ]]; then
+    HELPER="$LOCAL_HELPER"
+    return
+  fi
+  command -v curl >/dev/null 2>&1 || {
+    echo "curl not found and local helper missing: $LOCAL_HELPER" >&2
     exit 1
   }
+  TMP_HELPER="$(mktemp "${TMPDIR:-/tmp}/codex-nft-forward.helper.XXXXXX")"
+  curl -fsSL "${RAW_BASE_URL}/codex-nft-forward" -o "$TMP_HELPER"
+  chmod +x "$TMP_HELPER"
+  HELPER="$TMP_HELPER"
+}
+
+cleanup() {
+  if [[ -n "$TMP_HELPER" && -f "$TMP_HELPER" ]]; then
+    rm -f "$TMP_HELPER"
+  fi
 }
 
 remote_exec() {
@@ -46,7 +67,7 @@ install_remote() {
   need_helper
   helper_b64="$(base64 < "$HELPER" | tr -d '\n')"
 
-  "$SSH_BIN" -F "$SSH_CONFIG_FILE" "$target" /bin/sh <<REMOTE
+  "$SSH_BIN" -F "$SSH_CONFIG_FILE" "$target" /bin/bash -s <<REMOTE
 set -euo pipefail
 mkdir -p /usr/local/bin /etc/codex-nft-forward
 python3 - <<'PY'
@@ -122,4 +143,5 @@ main() {
   esac
 }
 
+trap cleanup EXIT
 main "$@"

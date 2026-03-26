@@ -404,6 +404,9 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 ExecStart={REMOTE_BIN} apply --quiet
+
+[Install]
+WantedBy=multi-user.target
 """
     timer = f"""[Unit]
 Description=Periodic Codex nft forward reconcile
@@ -420,6 +423,7 @@ WantedBy=timers.target
     SERVICE_PATH.write_text(service)
     TIMER_PATH.write_text(timer)
     run(["systemctl", "daemon-reload"])
+    run(["systemctl", "enable", "--now", "codex-nft-forward.service"])
     run(["systemctl", "enable", "--now", "codex-nft-forward.timer"])
     run(["systemctl", "start", "codex-nft-forward.service"])
     print(f"installed systemd service and timer (interval={interval_seconds}s)")

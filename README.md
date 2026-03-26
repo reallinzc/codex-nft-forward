@@ -28,43 +28,62 @@ It deletes and rebuilds only its own tables.
 
 ## Local wrapper
 
+Repo:
+
+```text
+https://github.com/reallinzc/codex-nft-forward
+```
+
+Direct GitHub invocation without cloning:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/reallinzc/codex-nft-forward/main/codex-nft-forward.sh) \
+  status my-host
+```
+
 Install helper + timer on a host:
 
 ```bash
-bash ./codex-nft-forward.sh install my-host --interval 300
+bash <(curl -fsSL https://raw.githubusercontent.com/reallinzc/codex-nft-forward/main/codex-nft-forward.sh) \
+  install my-host --interval 300
 ```
 
 The wrapper uses standard `ssh` and respects `SSH_CONFIG_FILE` (default: `~/.ssh/config`).
+If the helper binary is missing locally, the wrapper auto-fetches it from the same GitHub repo.
 
 Add or update a mapping:
 
 ```bash
-bash ./codex-nft-forward.sh upsert \
+bash <(curl -fsSL https://raw.githubusercontent.com/reallinzc/codex-nft-forward/main/codex-nft-forward.sh) upsert \
   my-host tw-exit 32097 example.com 24997 all --family auto
 ```
 
 Remove a mapping:
 
 ```bash
-bash ./codex-nft-forward.sh remove my-host tw-exit
+bash <(curl -fsSL https://raw.githubusercontent.com/reallinzc/codex-nft-forward/main/codex-nft-forward.sh) \
+  remove my-host tw-exit
 ```
 
 List configured mappings:
 
 ```bash
-bash ./codex-nft-forward.sh list my-host
+bash <(curl -fsSL https://raw.githubusercontent.com/reallinzc/codex-nft-forward/main/codex-nft-forward.sh) \
+  list my-host
 ```
 
 Re-apply immediately:
 
 ```bash
-bash ./codex-nft-forward.sh apply my-host
+bash <(curl -fsSL https://raw.githubusercontent.com/reallinzc/codex-nft-forward/main/codex-nft-forward.sh) \
+  apply my-host
 ```
 
 Status:
 
 ```bash
-bash ./codex-nft-forward.sh status my-host
+bash <(curl -fsSL https://raw.githubusercontent.com/reallinzc/codex-nft-forward/main/codex-nft-forward.sh) \
+  status my-host
 ```
 
 ## Migration note
